@@ -1,95 +1,133 @@
 import 'dart:math';
-
 import 'package:bureaucratic_chess/features/chess_game/data/models/piece_model.dart';
 import 'package:bureaucratic_chess/features/chess_game/domain/ai_evaluator.dart';
 import 'package:bureaucratic_chess/features/chess_game/domain/chess_engine.dart';
-import 'package:flutter/foundation.dart'; // Import for compute
+import 'package:flutter/foundation.dart';
 
-// --- NEW TOP-LEVEL FUNCTION FOR ISOLATE ---
-// This function must be top-level or static.
+// Top-level function for isolate
 List<int>? _runAInBackground(Map<String, dynamic> params) {
   final String fen = params['fen'];
   final int depth = params['depth'];
 
-  // Create new instances *inside* the isolate
   final ChessEngine aiEngine = ChessEngine();
   aiEngine.loadFromFen(fen);
 
   final ChessAI ai = ChessAI();
   return ai.findBestMove(aiEngine, depth);
 }
-// --- END NEW FUNCTION ---
 
 class ChessAI {
-  // Use large (but not infinite) values to prevent integer overflow.
   static const int _positiveInfinity = 9999999;
   static const int _negativeInfinity = -_positiveInfinity;
 
-  // --- NEW PUBLIC METHOD for compute ---
+  int _nodesSearched = 0;
+
   Future<List<int>?> findBestMoveAsync(String fen, int depth) async {
     return await compute(_runAInBackground, {
       'fen': fen,
       'depth': depth,
     });
   }
-  // --- END NEW METHOD ---
 
-
-  /// Finds the best move for the current player.
-  /// Returns a List [fromRow, fromCol, toRow, toCol]
-  List<int>? findBestMove(ChessEngine engine, int depth) {
+  /// Finds the best move - simplified, no iterative deepening
+  List<int>? findBestMove(ChessEngine engine, int maxDepth) {
+    _nodesSearched = 0;
     List<int>? bestMove;
     int bestScore = _negativeInfinity;
 
-    // The AI is the 'Maximizing' player (it wants the highest score).
-    // It assumes the opponent is the 'Minimizing' player.
     final allMoves = _getAllValidMoves(engine, engine.currentPlayer);
-    // Optional: Shuffle moves to add variation in games
-    allMoves.shuffle();
+
+    // ORDER MOVES for better pruning
+    _orderMoves(engine, allMoves);
 
     for (final moveTuple in allMoves) {
-      final fromRow = moveTuple[0],
-          fromCol = moveTuple[1],
-          toRow = moveTuple[2],
-          toCol = moveTuple[3];
+      final fromRow = moveTuple[0], fromCol = moveTuple[1],
+          toRow = moveTuple[2], toCol = moveTuple[3];
 
-      // 1. Make the move
       engine.makeMove(fromRow, fromCol, toRow, toCol);
 
-      // 2. Call minimax for the *opponent* (minimizing player)
-      int score = _minimax(
+      int score = -_minimax(
         engine,
-        depth - 1,
-        _negativeInfinity,
-        _positiveInfinity,
-        false, // 'false' because it's now the minimizing player's turn
+        maxDepth - 1,
+        -_positiveInfinity,
+        -_negativeInfinity,
       );
 
-      // 3. Undo the move to restore the board
       engine.undoMove();
 
-      // 4. Update the best score
       if (score > bestScore) {
         bestScore = score;
         bestMove = moveTuple;
       }
     }
+
     return bestMove;
   }
 
-  /// The recursive Minimax algorithm with Alpha-Beta Pruning.
-  int _minimax(
-      ChessEngine engine,
-      int depth,
-      int alpha,
-      int beta,
-      bool isMaximizingPlayer,
-      ) {
-    // --- Base Case: Check for game over or max depth ---
+  /// Order moves in place (most promising first)
+  void _orderMoves(ChessEngine engine, List<List<int>> moves) {
+    moves.sort((a, b) {
+      int scoreA = _quickMoveScore(engine, a);
+      int scoreB = _quickMoveScore(engine, b);
+      return scoreB.compareTo(scoreA);
+    });
+  }
+
+  /// Quick move scoring (no simulation, just heuristics)
+  int _quickMoveScore(ChessEngine engine, List<int> move) {
+    int score = 0;
+    final fromRow = move[0], fromCol = move[1];
+    final toRow = move[2], toCol = move[3];
+
+    final piece = engine.board[fromRow][fromCol];
+    final capturedPiece = engine.board[toRow][toCol];
+
+    if (piece == null) return score;
+
+    // Prioritize captures (MVV-LVA)
+    if (capturedPiece != null) {
+      int victimValue = _getPieceValue(capturedPiece.type);
+      int attackerValue = _getPieceValue(piece.type);
+      score += 10000 + victimValue * 10 - attackerValue;
+    }
+
+    // Center bonus
+    int centerDist = (toRow - 3).abs() + (toCol - 3).abs();
+    score += (6 - centerDist) * 5;
+
+    // Pawn advancement
+    if (piece.type == PieceType.pawn) {
+      score += piece.color == PieceColor.white ? (7 - toRow) * 10 : toRow * 10;
+    }
+
+    return score;
+  }
+
+  /// Get simple piece value
+  int _getPieceValue(PieceType type) {
+    switch (type) {
+      case PieceType.pawn: return 100;
+      case PieceType.knight: return 320;
+      case PieceType.bishop: return 330;
+      case PieceType.rook: return 500;
+      case PieceType.queen: return 900;
+      case PieceType.king: return 20000;
+      case PieceType.bureaucrat: return 0;
+    }
+  }
+
+  /// Simplified minimax - negamax style for cleaner code
+  int _minimax(ChessEngine engine, int depth, int alpha, int beta) {
+    _nodesSearched++;
+
     engine.updateGameStatus();
     if (engine.isGameOver()) {
-      if (engine.gameStatus.contains("White wins")) return _positiveInfinity;
-      if (engine.gameStatus.contains("Black wins")) return _negativeInfinity;
+      if (engine.gameStatus.contains("wins")) {
+        // If current player lost (opponent won), return very negative
+        return engine.gameStatus.contains(engine.currentPlayer == PieceColor.white ? "Black" : "White")
+            ? -_positiveInfinity
+            : _positiveInfinity;
+      }
       return 0; // Draw
     }
 
@@ -97,52 +135,38 @@ class ChessAI {
       return AIEvaluator.evaluate(engine);
     }
 
-    // --- Recursive Step ---
+    int maxScore = _negativeInfinity;
+    final allMoves = _getAllValidMoves(engine, engine.currentPlayer);
 
-    if (isMaximizingPlayer) {
-      int bestScore = _negativeInfinity;
-      final allMoves = _getAllValidMoves(engine, engine.currentPlayer);
-
-      for (final moveTuple in allMoves) {
-        engine.makeMove(
-            moveTuple[0], moveTuple[1], moveTuple[2], moveTuple[3]);
-        int score = _minimax(engine, depth - 1, alpha, beta, false);
-        engine.undoMove();
-
-        bestScore = max(bestScore, score);
-        alpha = max(alpha, bestScore);
-        if (beta <= alpha) {
-          break; // Beta cut-off
-        }
-      }
-      return bestScore;
+    // Quick pruning: if too many moves, only search promising ones
+    if (allMoves.length > 35 && depth > 1) {
+      _orderMoves(engine, allMoves);
+      allMoves.removeRange(35, allMoves.length);
+    } else {
+      _orderMoves(engine, allMoves);
     }
 
-    // else (isMinimizingPlayer)
-    else {
-      int bestScore = _positiveInfinity;
-      final allMoves = _getAllValidMoves(engine, engine.currentPlayer);
+    for (final moveTuple in allMoves) {
+      engine.makeMove(moveTuple[0], moveTuple[1], moveTuple[2], moveTuple[3]);
+      int score = -_minimax(engine, depth - 1, -beta, -alpha);
+      engine.undoMove();
 
-      for (final moveTuple in allMoves) {
-        engine.makeMove(
-            moveTuple[0], moveTuple[1], moveTuple[2], moveTuple[3]);
-        int score = _minimax(engine, depth - 1, alpha, beta, true);
-        engine.undoMove();
+      maxScore = max(maxScore, score);
+      alpha = max(alpha, score);
 
-        bestScore = min(bestScore, score);
-        beta = min(beta, bestScore);
-        if (beta <= alpha) {
-          break; // Alpha cut-off
-        }
+      if (alpha >= beta) {
+        break; // Beta cutoff
       }
-      return bestScore;
     }
+
+    return maxScore;
   }
 
-  /// Helper function to get all possible moves for a given color.
-  /// Returns a list of [fromRow, fromCol, toRow, toCol]
+  /// Get all valid moves for a color
   List<List<int>> _getAllValidMoves(ChessEngine engine, PieceColor color) {
     final List<List<int>> allMoves = [];
+
+    // Regular piece moves
     for (int r = 0; r < 8; r++) {
       for (int c = 0; c < 8; c++) {
         final piece = engine.board[r][c];

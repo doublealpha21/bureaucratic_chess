@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'package:bureaucratic_chess/features/chess_game/data/models/move_model.dart';
 import 'package:bureaucratic_chess/features/chess_game/data/models/piece_model.dart';
 import 'package:bureaucratic_chess/features/chess_game/domain/chess_ai.dart';
@@ -368,8 +369,9 @@ class ChessViewModel extends ChangeNotifier {
   // --- AI & HINT METHODS START ---
 
   /// Triggers the AI to make a move.
+  /// Triggers the AI to make a move (UPDATED VERSION)
+  /// Triggers the AI to make a move - FAST VERSION
   Future<void> _makeAIMove() async {
-    // Only run if it's an AI game, it's AI's turn, and game is not over.
     if (!_isAIGame ||
         _engine.currentPlayer == _playerColor ||
         _engine.isGameOver() ||
@@ -380,30 +382,96 @@ class ChessViewModel extends ChangeNotifier {
     _isThinking = true;
     notifyListeners();
 
-    // --- MODIFICATION: Run AI in background ---
-    final String currentFen = _engine.getBoardFen();
-    final List<int>? bestMove =
-    await _ai.findBestMoveAsync(currentFen, _aiDifficulty);
-    // --- END MODIFICATION ---
+    // Small delay for UI responsiveness
+    await Future.delayed(const Duration(milliseconds: 50));
 
+    final String currentFen = _engine.getBoardFen();
+
+    // Check if AI should deploy bureaucrat (simple heuristic)
+    if (_engine.canDeployBureaucrat() && Random().nextDouble() < 0.3) {
+      // 30% chance to consider bureaucrat deployment
+      List<int>? bureaucratPos = _quickBureaucratPosition();
+
+      if (bureaucratPos != null) {
+        _isThinking = false;
+        if (_engine.getBoardFen() != currentFen) return;
+
+        _engine.deployBureaucrat(bureaucratPos[0], bureaucratPos[1]);
+        if (_engine.isGameOver()) _stopTimer();
+        notifyListeners();
+        return;
+      }
+    }
+
+    // Make regular move
+    final List<int>? bestMove = await _ai.findBestMoveAsync(currentFen, _aiDifficulty);
     _isThinking = false;
 
-    // Check if game state changed (e.g., user reset) while AI was thinking
-    if (_engine.getBoardFen() != currentFen) {
-      return;
-    }
+    if (_engine.getBoardFen() != currentFen) return;
 
     if (bestMove != null) {
       _engine.makeMove(bestMove[0], bestMove[1], bestMove[2], bestMove[3]);
     } else {
-      // AI couldn't find a move (e.g., stalemate/checkmate)
       _engine.updateGameStatus();
     }
 
-    if (_engine.isGameOver()) {
-      _stopTimer();
-    }
+    if (_engine.isGameOver()) _stopTimer();
     notifyListeners();
+  }
+
+  /// Quick bureaucrat positioning without heavy computation
+  List<int>? _quickBureaucratPosition() {
+    // Find opponent king
+    List<int>? opponentKingPos;
+    PieceColor opponentColor = _engine.currentPlayer == PieceColor.white
+        ? PieceColor.black
+        : PieceColor.white;
+
+    for (int r = 0; r < 8; r++) {
+      for (int c = 0; c < 8; c++) {
+        final piece = _engine.board[r][c];
+        if (piece?.type == PieceType.king && piece?.color == opponentColor) {
+          opponentKingPos = [r, c];
+          break;
+        }
+      }
+      if (opponentKingPos != null) break;
+    }
+
+    if (opponentKingPos == null) return null;
+
+    // Try to place bureaucrat near opponent king
+    List<List<int>> candidates = [];
+
+    for (int dr = -2; dr <= 2; dr++) {
+      for (int dc = -2; dc <= 2; dc++) {
+        int r = opponentKingPos[0] + dr;
+        int c = opponentKingPos[1] + dc;
+
+        if (r >= 0 && r < 8 && c >= 0 && c < 8 && _engine.board[r][c] == null) {
+          candidates.add([r, c]);
+        }
+      }
+    }
+
+    // Return random candidate near king, or center square
+    if (candidates.isNotEmpty) {
+      return candidates[Random().nextInt(candidates.length)];
+    }
+
+    // Fallback: try center squares
+    List<List<int>> centerSquares = [
+      [3, 3], [3, 4], [4, 3], [4, 4],
+      [2, 3], [2, 4], [5, 3], [5, 4],
+    ];
+
+    for (var pos in centerSquares) {
+      if (_engine.board[pos[0]][pos[1]] == null) {
+        return pos;
+      }
+    }
+
+    return null;
   }
 
   /// Finds and highlights a hint move.
